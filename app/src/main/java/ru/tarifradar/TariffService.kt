@@ -73,6 +73,7 @@ class TariffService : AccessibilityService() {
     private var homePkg: String? = null
 
     private var overlay: TextView? = null
+    private var nightView: android.view.View? = null
     private var overlayLp: WindowManager.LayoutParams? = null
 
     private val tick = object : Runnable {
@@ -140,6 +141,7 @@ class TariffService : AccessibilityService() {
         instance = null
         handler.removeCallbacksAndMessages(null)
         removeOverlay()
+        removeNight()
     }
 
     private fun isWbPackage(pkg: String) =
@@ -200,6 +202,7 @@ class TariffService : AccessibilityService() {
             alerted.addAll(fresh)
             val text = hits.entries.joinToString(", ") { "${it.key}: ${Fmt.price(it.value)}" } +
                     " (порог ${Fmt.price(thr)})"
+            prefs.nightMode = false // убрать чёрный экран, чтобы были видны тарифы
             AlarmPlayer.fire(this, text, prefs.soundOn)
         }
     }
@@ -402,9 +405,49 @@ class TariffService : AccessibilityService() {
 
     private fun syncOverlay(now: Long) {
         val want = prefs.monitoring
+        val wantNight = want && prefs.nightMode
+        if (wantNight && nightView == null) {
+            removeOverlay()   // плашку добавим заново, чтобы она была поверх чёрного
+            showNight()
+        }
+        if (!wantNight && nightView != null) removeNight()
         if (want && overlay == null) showOverlay()
         if (!want && overlay != null) removeOverlay()
+        overlay?.alpha = if (nightView != null) 0.45f else 1f
         overlay?.text = overlayText(now)
+    }
+
+    private fun showNight() {
+        try {
+            val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+            val v = android.view.View(this).apply { setBackgroundColor(Color.BLACK) }
+            val lp = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                        WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.OPAQUE
+            ).apply {
+                screenBrightness = 0.01f
+            }
+            wm.addView(v, lp)
+            nightView = v
+        } catch (t: Throwable) {
+            prefs.status = "Не удалось включить ночной режим: ${t.message}"
+            prefs.nightMode = false
+        }
+    }
+
+    private fun removeNight() {
+        val v = nightView ?: return
+        nightView = null
+        try {
+            (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(v)
+        } catch (_: Throwable) {}
     }
 
     private fun overlayText(now: Long): String {
@@ -483,6 +526,7 @@ class TariffService : AccessibilityService() {
                             prefs.overlayY = lp.y
                         } else {
                             prefs.monitoring = false
+                            prefs.nightMode = false
                             prefs.status = "Слежка остановлена"
                             handler.post { syncOverlay(System.currentTimeMillis()) }
                         }

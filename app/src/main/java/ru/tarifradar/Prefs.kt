@@ -51,6 +51,11 @@ class Prefs(ctx: Context) {
         get() = p.getInt("ovy", -1)
         set(v) = p.edit().putInt("ovy", v).apply()
 
+    /** Ночной режим: чёрный экран поверх всего, слежка идёт под ним. */
+    var nightMode: Boolean
+        get() = p.getBoolean("night", false)
+        set(v) = p.edit().putBoolean("night", v).apply()
+
     var soundOn: Boolean
         get() = p.getBoolean("sound", true)
         set(v) = p.edit().putBoolean("sound", v).apply()

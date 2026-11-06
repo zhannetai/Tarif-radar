@@ -156,6 +156,8 @@ class MainActivity : Activity() {
         col.addView(label("Откройте в WB Job экран «Тарифы операций» (фильтр «Операция» — сборка) и поставьте телефон на зарядку. Экран не будет гаснуть, пока идёт слежка.", 13f))
         btnMonitor = button("") { toggleMonitoring() }
         col.addView(btnMonitor)
+        col.addView(button("🌙 Ночная слежка (чёрный экран)") { startNight() })
+        col.addView(label("Ночью: откройте WB Job на «Тарифы операций», поставьте на зарядку. Экран станет чёрным, но не погаснет — слежка идёт. Когда сработает будильник, чёрный экран уберётся. Тап по тусклой плашке — стоп.", 12f))
         tvStatus = label(size = 13f)
         col.addView(tvStatus)
 
@@ -242,6 +244,7 @@ class MainActivity : Activity() {
     private fun toggleMonitoring() {
         if (prefs.monitoring) {
             prefs.monitoring = false
+            prefs.nightMode = false
             prefs.status = "Слежка остановлена"
             render()
             return
@@ -261,6 +264,18 @@ class MainActivity : Activity() {
             Toast.makeText(this, "Откройте в WB Job «Тарифы операций»", Toast.LENGTH_LONG).show()
             startActivity(it)
         }
+    }
+
+    private fun startNight() {
+        if (TariffService.instance == null) {
+            Toast.makeText(this, "Сначала включите «Тариф-радар» в спец. возможностях", Toast.LENGTH_LONG).show()
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            return
+        }
+        prefs.nightMode = true
+        if (!prefs.monitoring) toggleMonitoring()
+        else packageManager.getLaunchIntentForPackage(prefs.wbPackage)?.let { startActivity(it) }
+        render()
     }
 
     private fun saveSettings(silent: Boolean = false) {
