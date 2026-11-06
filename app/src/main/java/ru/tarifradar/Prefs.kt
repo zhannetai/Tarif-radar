@@ -26,7 +26,11 @@ class Prefs(ctx: Context) {
 
     /** Текст кнопки, по которой открываются тарифы с предыдущего экрана. */
     var entryText: String
-        get() = p.getString("entry", "Тарифы") ?: "Тарифы"
+        get() {
+            val v = p.getString("entry", null)?.trim()
+            // Раньше по умолчанию было «Тарифы» — это заголовок меню, а нажимать нужно пункт.
+            return if (v.isNullOrEmpty() || v.equals("Тарифы", ignoreCase = true)) "Тарифы операций" else v
+        }
         set(v) = p.edit().putString("entry", v).apply()
 
     /** Подглядывать в WB Job, когда он свёрнут (открыть на пару секунд и вернуть назад). */

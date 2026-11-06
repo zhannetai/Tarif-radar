@@ -45,7 +45,16 @@ object Parser {
         }
     }
 
+    /** Пункты, которые есть только на промежуточном экране «Тарифы» (меню), а не на самих тарифах. */
+    private val MENU_MARKERS = listOf("Тарифы потеряшек", "Начисления за пики", "Списания по каждому")
+
     fun hasTitle(items: List<Item>) = items.any { it.text.contains(TITLE, ignoreCase = true) }
+
+    fun isMenuScreen(items: List<Item>) =
+        items.any { item -> MENU_MARKERS.any { item.text.contains(it, ignoreCase = true) } }
+
+    /** Экран «Тарифы операций» с ценами (а не меню, где «Тарифы операций» — просто пункт). */
+    fun isTariffScreen(items: List<Item>) = hasTitle(items) && !isMenuScreen(items)
 
     fun dump(items: List<Item>): String =
         items.sortedWith(compareBy<Item>({ it.top }, { it.left }))
@@ -54,7 +63,7 @@ object Parser {
 
     fun parse(items: List<Item>): Result {
         val sorted = items.sortedWith(compareBy<Item>({ it.top }, { it.left }))
-        val isTariff = hasTitle(sorted)
+        val isTariff = isTariffScreen(sorted)
         val prices = LinkedHashMap<String, Double>()
         if (isTariff) {
             var block: String? = null

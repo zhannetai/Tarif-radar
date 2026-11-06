@@ -366,7 +366,7 @@ class TariffService : AccessibilityService() {
         val pkg = root.packageName?.toString() ?: ""
         if (!isWbPackage(pkg)) return Click.NOT_FOUND
         val items = Parser.collect(root)
-        if (Parser.hasTitle(items)) return Click.STILL_ON_TARIFFS
+        if (Parser.isTariffScreen(items)) return Click.STILL_ON_TARIFFS
         val d = Parser.dump(items)
         if (d != lastDumpO) { lastDumpO = d; prefs.dumpOther = d }
 
