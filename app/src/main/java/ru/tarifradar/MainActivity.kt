@@ -49,6 +49,8 @@ class MainActivity : Activity() {
     private lateinit var etInt: EditText
     private lateinit var etEntry: EditText
     private lateinit var cbSound: CheckBox
+    private lateinit var cbPeek: CheckBox
+    private lateinit var etIdle: EditText
     private lateinit var chartRecent: ChartView
     private lateinit var chartHourly: ChartView
     private lateinit var chartFreq: ChartView
@@ -176,6 +178,13 @@ class MainActivity : Activity() {
             isChecked = prefs.soundOn
         }
         col.addView(cbSound)
+        cbPeek = CheckBox(this).apply {
+            text = "Подглядывать, когда WB Job свёрнут (на 3–5 сек откроет WB Job и вернёт обратно)"
+            isChecked = prefs.peekMode
+        }
+        col.addView(cbPeek)
+        val (fIdle, eIdle) = field("Подглядывать, если телефон не трогали, сек", prefs.idleSec.toString(), InputType.TYPE_CLASS_NUMBER)
+        etIdle = eIdle; col.addView(fIdle)
         col.addView(button("Сохранить настройки") { saveSettings() })
 
         col.addView(header("Блоки"))
@@ -223,6 +232,7 @@ class MainActivity : Activity() {
         ))
         col.addView(button("Очистить статистику") { confirmClear() })
         col.addView(button("Настройки батареи для приложения") { openAppSettings() })
+        col.addView(button("Xiaomi: разрешить открывать окна в фоне") { openXiaomiPerms() })
 
         return ScrollView(this).apply { addView(col) }
     }
@@ -262,6 +272,9 @@ class MainActivity : Activity() {
         if (interval != null && interval in 1..180) prefs.intervalMin = interval else errors.add("интервал (1–180 мин)")
         if (entry.isNotEmpty()) prefs.entryText = entry else errors.add("текст кнопки")
         prefs.soundOn = cbSound.isChecked
+        prefs.peekMode = cbPeek.isChecked
+        val idle = etIdle.text.toString().trim().toIntOrNull()
+        if (idle != null && idle in 3..600) prefs.idleSec = idle else errors.add("секунды без касаний (3–600)")
         if (errors.isNotEmpty()) {
             Toast.makeText(this, "Проверьте: " + errors.joinToString(", "), Toast.LENGTH_LONG).show()
         } else if (!silent) {
@@ -321,6 +334,20 @@ class MainActivity : Activity() {
             .setPositiveButton("Удалить") { _, _ -> db.clear(); shownBlocks = emptyList(); render() }
             .setNegativeButton("Отмена", null)
             .show()
+    }
+
+    private fun openXiaomiPerms() {
+        val miui = Intent("miui.intent.action.APP_PERM_EDITOR").apply {
+            setClassName("com.miui.securitycenter", "com.miui.permcenter.permissions.PermissionsEditorActivity")
+            putExtra("extra_pkgname", packageName)
+        }
+        try {
+            startActivity(miui)
+            Toast.makeText(this, "Включите «Отображать всплывающие окна, когда запущено в фоновом режиме»", Toast.LENGTH_LONG).show()
+        } catch (_: Throwable) {
+            openAppSettings()
+            Toast.makeText(this, "Откройте «Другие разрешения» → всплывающие окна в фоне", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun openAppSettings() {

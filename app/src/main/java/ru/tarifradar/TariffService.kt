@@ -2,6 +2,7 @@ package ru.tarifradar
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Path
@@ -11,19 +12,19 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
+import kotlin.math.abs
 
 /**
  * Служба «специальных возможностей»: читает экран WB Job.
  *
- * Как работает слежка:
- *  1. Вы открываете в WB Job экран «Тарифы операций».
- *  2. Служба читает тарифы сборки и сохраняет их.
- *  3. Раз в N минут нажимает «назад», потом кнопку «Тарифы» — экран обновляется, служба читает снова.
- *  4. Если тариф выбранного блока ≥ порога — звонит будильник.
+ * Обычный режим: открыт экран «Тарифы операций» → раз в N минут «назад» + «Тарифы» → читаем.
+ * Режим «подглядывания»: WB Job свёрнут → ждём, пока телефон не трогают X секунд →
+ *   открываем WB Job, обновляем и читаем тарифы → возвращаем человека в приложение, где он был.
  * Кнопку «назад» служба жмёт ТОЛЬКО когда на экране точно «Тарифы операций».
  */
 class TariffService : AccessibilityService() {
@@ -31,9 +32,22 @@ class TariffService : AccessibilityService() {
     companion object {
         @Volatile var instance: TariffService? = null
         const val ACTION_UPDATED = "ru.tarifradar.UPDATED"
+
+        private const val ACTIVITY_TYPES =
+            AccessibilityEvent.TYPE_VIEW_CLICKED or
+                    AccessibilityEvent.TYPE_VIEW_LONG_CLICKED or
+                    AccessibilityEvent.TYPE_VIEW_SCROLLED or
+                    AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
+                    AccessibilityEvent.TYPE_VIEW_SELECTED
+
+        /** Когда эти приложения на экране — не подглядываем (звонок, шторка, камера, клавиатура). */
+        private val BUSY = listOf(
+            "systemui", "incallui", "dialer", "telecom", "com.android.phone",
+            "camera", "inputmethod", "keyboard", "voip"
+        )
     }
 
-    private enum class Step { IDLE, WAIT_BACK, WAIT_LOAD }
+    private enum class Step { IDLE, PEEK_OPEN, WAIT_BACK, WAIT_LOAD }
     private enum class Click { OK, STILL_ON_TARIFFS, NOT_FOUND }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -52,7 +66,14 @@ class TariffService : AccessibilityService() {
     private var lastDumpT = ""
     private var lastDumpO = ""
 
+    private var peeking = false
+    private var returnPkg: String? = null
+    private var lastUserActivityAt = 0L
+    private var waitReason = ""
+    private var homePkg: String? = null
+
     private var overlay: TextView? = null
+    private var overlayLp: WindowManager.LayoutParams? = null
 
     private val tick = object : Runnable {
         override fun run() {
@@ -71,6 +92,11 @@ class TariffService : AccessibilityService() {
         db = Db.get(this)
         instance = this
         AlarmPlayer.ensureChannels(this)
+        homePkg = try {
+            packageManager.resolveActivity(
+                Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0
+            )?.activityInfo?.packageName
+        } catch (_: Throwable) { null }
         prefs.status = "Служба запущена"
         handler.removeCallbacks(tick)
         handler.post(tick)
@@ -78,8 +104,17 @@ class TariffService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (instance == null) return
-        val pkg = event?.packageName?.toString() ?: return
-        if (pkg == packageName || !isWbPackage(pkg)) return
+        val e = event ?: return
+        val pkg = e.packageName?.toString() ?: return
+        val now = System.currentTimeMillis()
+        if (pkg == packageName) {
+            if ((e.eventType and ACTIVITY_TYPES) != 0) lastUserActivityAt = now
+            return
+        }
+        val wb = isWbPackage(pkg)
+        // Человек что-то нажимает / листает в другом приложении — значит, пользуется телефоном.
+        if (!wb && (e.eventType and ACTIVITY_TYPES) != 0) lastUserActivityAt = now
+        if (!wb) return
         if (!scanQueued) {
             scanQueued = true
             handler.postDelayed({
@@ -110,6 +145,8 @@ class TariffService : AccessibilityService() {
     private fun isWbPackage(pkg: String) =
         pkg == prefs.wbPackage || pkg.contains("wildberries", ignoreCase = true)
 
+    private fun isBusy(pkg: String) = BUSY.any { pkg.contains(it, ignoreCase = true) }
+
     private fun intervalMs() = prefs.intervalMin.coerceIn(1, 180) * 60_000L
 
     /** Прочитать текущий экран. */
@@ -131,6 +168,8 @@ class TariffService : AccessibilityService() {
     }
 
     private fun onPrices(prices: Map<String, Double>, now: Long) {
+        // Только что вытащили WB Job из фона — на экране старые цифры, их не пишем.
+        if (step == Step.PEEK_OPEN || step == Step.WAIT_BACK) return
         val forced = step == Step.WAIT_LOAD
         val changed = prices != lastValues
         if (forced || !savedThisVisit || changed) {
@@ -138,11 +177,15 @@ class TariffService : AccessibilityService() {
             lastValues = HashMap(prices)
             savedThisVisit = true
             nextRefreshAt = now + intervalMs()
+            waitReason = ""
             prefs.status = "Последний замер в ${Fmt.time(now)}"
             checkAlarm(prices)
             sendBroadcast(Intent(ACTION_UPDATED).setPackage(packageName))
         }
-        if (forced) step = Step.IDLE
+        if (forced) {
+            step = Step.IDLE
+            finishPeek()
+        }
     }
 
     private fun checkAlarm(prices: Map<String, Double>) {
@@ -165,39 +208,46 @@ class TariffService : AccessibilityService() {
         val now = System.currentTimeMillis()
         syncOverlay(now)
         if (!prefs.monitoring) {
+            if (peeking) finishPeek()
             step = Step.IDLE
             return
         }
         when (step) {
-            Step.IDLE -> {
-                if (now < nextRefreshAt || now - lastAutoScanAt < 3000) return
-                lastAutoScanAt = now
-                val r = scan() ?: return
-                if (!r.isTariffScreen) {
-                    prefs.status = "Жду экран «Тарифы операций»"
+            Step.IDLE -> idleTick(now)
+
+            Step.PEEK_OPEN -> {
+                if (now - stepAt < 1200) return
+                val r = scan()
+                if (r?.isTariffScreen == true) {
+                    pressBack(now)
                     return
                 }
-                if (now < nextRefreshAt) return // только что сохранили свежие данные
-                if (performGlobalAction(GLOBAL_ACTION_BACK)) {
-                    savedThisVisit = false
-                    step = Step.WAIT_BACK
-                    stepAt = now
-                    tries = 0
-                    prefs.status = "Обновляю тарифы…"
+                // WB Job открылся не на тарифах — пробуем нажать «Тарифы»
+                if (now - stepAt >= 2500) {
+                    when (clickEntry()) {
+                        Click.OK -> { step = Step.WAIT_LOAD; stepAt = now }
+                        Click.STILL_ON_TARIFFS -> pressBack(now)
+                        Click.NOT_FOUND -> if (now - stepAt > 7000) {
+                            fail(now, "WB Job открылся не на тарифах. Откройте «Тарифы операций» и сверните WB Job.")
+                        }
+                    }
                 }
             }
+
             Step.WAIT_BACK -> {
                 if (now - stepAt < 1500) return
                 when (clickEntry()) {
                     Click.OK -> { step = Step.WAIT_LOAD; stepAt = now }
-                    Click.STILL_ON_TARIFFS -> { step = Step.IDLE; nextRefreshAt = now + 5000 }
+                    Click.STILL_ON_TARIFFS -> {
+                        step = Step.IDLE
+                        nextRefreshAt = now + 5000
+                        finishPeek()
+                    }
                     Click.NOT_FOUND -> {
                         tries++
                         stepAt = now
                         if (tries >= 4) {
-                            step = Step.IDLE
-                            nextRefreshAt = now + intervalMs()
-                            prefs.status = "Не нашёл кнопку «${prefs.entryText}»"
+                            fail(now, "Не нашёл кнопку «${prefs.entryText}»")
                             AlarmPlayer.info(
                                 this, "Тариф-радар потерял экран",
                                 "Не нашёл кнопку «${prefs.entryText}». Откройте «Тарифы операций» вручную — слежка продолжится."
@@ -206,11 +256,10 @@ class TariffService : AccessibilityService() {
                     }
                 }
             }
+
             Step.WAIT_LOAD -> {
                 if (now - stepAt > 15_000) {
-                    step = Step.IDLE
-                    nextRefreshAt = now + 5000
-                    prefs.status = "Экран тарифов не открылся — жду, пока откроете вручную"
+                    fail(now, "Экран тарифов не открылся")
                 } else if (now - stepAt >= 1500 && now - lastAutoScanAt >= 1500) {
                     lastAutoScanAt = now
                     scan()
@@ -219,9 +268,103 @@ class TariffService : AccessibilityService() {
         }
     }
 
+    private fun idleTick(now: Long) {
+        if (now < nextRefreshAt || now - lastAutoScanAt < 3000) return
+        lastAutoScanAt = now
+        val root = rootInActiveWindow
+        if (root == null) { waitReason = "жду (экран выключен?)"; return }
+        val pkg = root.packageName?.toString() ?: ""
+        if (pkg == packageName) { waitReason = "жду, пока закроете Тариф-радар"; return }
+
+        val r = scan() ?: return
+        if (r.isTariffScreen) {
+            if (now < nextRefreshAt) return // только что сохранили свежие данные
+            pressBack(now)
+            return
+        }
+        if (isWbPackage(pkg)) { waitReason = "WB Job открыт не на тарифах"; return }
+        if (!prefs.peekMode) { waitReason = "WB Job свёрнут — откройте тарифы"; return }
+        if (isBusy(pkg)) { waitReason = "жду (звонок / шторка / клавиатура)"; return }
+        val need = prefs.idleSec.coerceIn(3, 600) * 1000L
+        val idle = now - lastUserActivityAt
+        if (idle < need) {
+            waitReason = "жду, пока не трогаете телефон (${(need - idle) / 1000 + 1} с)"
+            return
+        }
+        startPeek(pkg, now)
+    }
+
+    private fun pressBack(now: Long) {
+        if (performGlobalAction(GLOBAL_ACTION_BACK)) {
+            savedThisVisit = false
+            step = Step.WAIT_BACK
+            stepAt = now
+            tries = 0
+            prefs.status = "Обновляю тарифы…"
+        } else {
+            fail(now, "Не получилось нажать «назад»")
+        }
+    }
+
+    private fun startPeek(fromPkg: String, now: Long) {
+        val intent = packageManager.getLaunchIntentForPackage(prefs.wbPackage)
+        if (intent == null) {
+            waitReason = "не нашёл WB Job на телефоне"
+            return
+        }
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        returnPkg = fromPkg
+        peeking = true
+        step = Step.PEEK_OPEN
+        stepAt = now
+        savedThisVisit = false
+        prefs.status = "Подглядываю в WB Job…"
+        try {
+            startActivity(intent)
+        } catch (t: Throwable) {
+            peeking = false
+            returnPkg = null
+            step = Step.IDLE
+            nextRefreshAt = now + 60_000
+            waitReason = "Xiaomi не дал открыть WB Job (нужно разрешение «всплывающие окна в фоне»)"
+        }
+    }
+
+    private fun fail(now: Long, msg: String) {
+        step = Step.IDLE
+        nextRefreshAt = now + intervalMs()
+        prefs.status = msg
+        finishPeek()
+    }
+
+    /** Вернуть человека туда, где он был до «подглядывания». */
+    private fun finishPeek() {
+        if (!peeking) return
+        peeking = false
+        val p = returnPkg
+        returnPkg = null
+        handler.postDelayed({
+            try {
+                val launch = if (p == null || p == homePkg) null
+                else packageManager.getLaunchIntentForPackage(p)
+                if (launch == null) {
+                    performGlobalAction(GLOBAL_ACTION_HOME)
+                } else {
+                    launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(launch)
+                }
+            } catch (_: Throwable) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
+            }
+            lastUserActivityAt = System.currentTimeMillis() - prefs.idleSec * 1000L + 2000
+        }, 300)
+    }
+
     /** На предыдущем экране найти кнопку «Тарифы» и нажать. */
     private fun clickEntry(): Click {
         val root = rootInActiveWindow ?: return Click.NOT_FOUND
+        val pkg = root.packageName?.toString() ?: ""
+        if (!isWbPackage(pkg)) return Click.NOT_FOUND
         val items = Parser.collect(root)
         if (Parser.hasTitle(items)) return Click.STILL_ON_TARIFFS
         val d = Parser.dump(items)
@@ -255,7 +398,7 @@ class TariffService : AccessibilityService() {
     private fun nodeText(n: AccessibilityNodeInfo): String =
         (n.text ?: n.contentDescription)?.toString()?.trim() ?: ""
 
-    // ---------- Плашка поверх экрана (держит экран включённым) ----------
+    // ---------- Плашка поверх экрана ----------
 
     private fun syncOverlay(now: Long) {
         val want = prefs.monitoring
@@ -266,35 +409,33 @@ class TariffService : AccessibilityService() {
 
     private fun overlayText(now: Long): String {
         val top = lastValues.filterKeys { it !in prefs.disabledBlocks }.maxByOrNull { it.value }
-        val line1 = if (top == null) "Радар: откройте «Тарифы операций»"
+        val line1 = if (top == null) "Радар: ещё нет замеров"
         else "Радар: макс ${top.key} ${Fmt.price(top.value)}"
         val line2 = when {
+            peeking || step == Step.PEEK_OPEN -> "подглядываю в WB Job…"
             step != Step.IDLE -> "обновляю…"
-            lastValues.isEmpty() || nextRefreshAt == 0L -> "нажми — стоп"
+            nextRefreshAt == 0L || now >= nextRefreshAt ->
+                waitReason.ifEmpty { "откройте «Тарифы операций»" }
             else -> {
                 val s = ((nextRefreshAt - now) / 1000).coerceAtLeast(0)
-                "обновлю через %d:%02d · нажми — стоп".format(s / 60, s % 60)
+                "обновлю через %d:%02d".format(s / 60, s % 60)
             }
         }
-        return "$line1\n$line2"
+        return "$line1\n$line2\nтап — стоп, тяни — двигать"
     }
 
+    @SuppressLint("ClickableViewAccessibility")
     private fun showOverlay() {
         try {
             val wm = getSystemService(WINDOW_SERVICE) as WindowManager
             val dp = resources.displayMetrics.density
             val tv = TextView(this).apply {
                 setTextColor(Color.WHITE)
-                textSize = 12f
+                textSize = 11f
                 setPadding((10 * dp).toInt(), (6 * dp).toInt(), (10 * dp).toInt(), (6 * dp).toInt())
                 background = GradientDrawable().apply {
                     setColor(0xDD4A2A8C.toInt())
                     cornerRadius = 14 * dp
-                }
-                setOnClickListener {
-                    prefs.monitoring = false
-                    prefs.status = "Слежка остановлена"
-                    handler.post { syncOverlay(System.currentTimeMillis()) }
                 }
             }
             val lp = WindowManager.LayoutParams(
@@ -307,11 +448,52 @@ class TariffService : AccessibilityService() {
                 PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.BOTTOM or Gravity.END
-                x = (12 * dp).toInt()
-                y = (120 * dp).toInt()
+                x = if (prefs.overlayX >= 0) prefs.overlayX else (12 * dp).toInt()
+                y = if (prefs.overlayY >= 0) prefs.overlayY else (120 * dp).toInt()
+            }
+
+            var downX = 0f
+            var downY = 0f
+            var startX = 0
+            var startY = 0
+            var moved = false
+            tv.setOnTouchListener { v, ev ->
+                when (ev.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        downX = ev.rawX; downY = ev.rawY
+                        startX = lp.x; startY = lp.y
+                        moved = false
+                        true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = ev.rawX - downX
+                        val dy = ev.rawY - downY
+                        if (abs(dx) > 12 * dp || abs(dy) > 12 * dp) moved = true
+                        if (moved) {
+                            // gravity BOTTOM|END: x считается от правого края, y — от нижнего
+                            lp.x = (startX - dx).toInt().coerceAtLeast(0)
+                            lp.y = (startY - dy).toInt().coerceAtLeast(0)
+                            try { wm.updateViewLayout(v, lp) } catch (_: Throwable) {}
+                        }
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        if (moved) {
+                            prefs.overlayX = lp.x
+                            prefs.overlayY = lp.y
+                        } else {
+                            prefs.monitoring = false
+                            prefs.status = "Слежка остановлена"
+                            handler.post { syncOverlay(System.currentTimeMillis()) }
+                        }
+                        true
+                    }
+                    else -> false
+                }
             }
             wm.addView(tv, lp)
             overlay = tv
+            overlayLp = lp
         } catch (t: Throwable) {
             prefs.status = "Не удалось показать плашку: ${t.message}"
         }
@@ -320,6 +502,7 @@ class TariffService : AccessibilityService() {
     private fun removeOverlay() {
         val v = overlay ?: return
         overlay = null
+        overlayLp = null
         try {
             (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(v)
         } catch (_: Throwable) {}
@@ -329,7 +512,11 @@ class TariffService : AccessibilityService() {
     fun onMonitoringStarted() {
         alerted.clear()
         step = Step.IDLE
+        peeking = false
+        returnPkg = null
         nextRefreshAt = 0L
         lastAutoScanAt = 0L
+        lastUserActivityAt = 0L
+        waitReason = ""
     }
 }

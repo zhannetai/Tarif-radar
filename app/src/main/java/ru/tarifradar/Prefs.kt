@@ -29,6 +29,24 @@ class Prefs(ctx: Context) {
         get() = p.getString("entry", "Тарифы") ?: "Тарифы"
         set(v) = p.edit().putString("entry", v).apply()
 
+    /** Подглядывать в WB Job, когда он свёрнут (открыть на пару секунд и вернуть назад). */
+    var peekMode: Boolean
+        get() = p.getBoolean("peek", true)
+        set(v) = p.edit().putBoolean("peek", v).apply()
+
+    /** Сколько секунд телефон должен быть «без касаний», чтобы подглядеть. */
+    var idleSec: Int
+        get() = p.getInt("idle", 15)
+        set(v) = p.edit().putInt("idle", v).apply()
+
+    var overlayX: Int
+        get() = p.getInt("ovx", -1)
+        set(v) = p.edit().putInt("ovx", v).apply()
+
+    var overlayY: Int
+        get() = p.getInt("ovy", -1)
+        set(v) = p.edit().putInt("ovy", v).apply()
+
     var soundOn: Boolean
         get() = p.getBoolean("sound", true)
         set(v) = p.edit().putBoolean("sound", v).apply()
