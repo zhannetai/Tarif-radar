@@ -24,6 +24,40 @@ object Parser {
         val dump: String
     )
 
+    private val spaces = Regex("[\\u00A0\\u202F\\u2007\\u2009 \\t]+")
+
+    /** Все виды пробелов → обычный пробел. */
+    fun norm(s: String): String = s.split('\n').joinToString("\n") { it.replace(spaces, " ").trim() }.trim()
+
+    fun nodeText(n: AccessibilityNodeInfo): String =
+        norm((n.text?.toString()?.takeIf { it.isNotBlank() } ?: n.contentDescription?.toString()) ?: "")
+
+    /** Найти на экране элемент, текст которого (первая строка) совпадает с target или начинается с него. */
+    fun findByText(root: AccessibilityNodeInfo, target: String): AccessibilityNodeInfo? {
+        val t = norm(target)
+        var exact: AccessibilityNodeInfo? = null
+        var starts: AccessibilityNodeInfo? = null
+        var contains: AccessibilityNodeInfo? = null
+        fun go(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 40 || exact != null) return
+            val txt = nodeText(n)
+            if (txt.isNotEmpty() && n.isVisibleToUser) {
+                val first = txt.lineSequence().first()
+                when {
+                    first.equals(t, true) -> { exact = n; return }
+                    starts == null && first.startsWith(t, true) -> starts = n
+                    contains == null && txt.contains(t, true) -> contains = n
+                }
+            }
+            for (i in 0 until n.childCount) {
+                val ch = n.getChild(i) ?: continue
+                go(ch, depth + 1)
+            }
+        }
+        go(root, 0)
+        return exact ?: starts ?: contains
+    }
+
     fun collect(root: AccessibilityNodeInfo): List<Item> {
         val out = ArrayList<Item>()
         walk(root, out, 0)
@@ -32,9 +66,8 @@ object Parser {
 
     private fun walk(node: AccessibilityNodeInfo, out: MutableList<Item>, depth: Int) {
         if (depth > 40) return
-        val t = (node.text?.toString()?.takeIf { it.isNotBlank() }
-            ?: node.contentDescription?.toString())?.trim()
-        if (!t.isNullOrEmpty() && node.isVisibleToUser) {
+        val t = nodeText(node)
+        if (t.isNotEmpty() && node.isVisibleToUser) {
             val r = Rect()
             node.getBoundsInScreen(r)
             out.add(Item(t, r.top, r.left))

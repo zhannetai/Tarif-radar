@@ -67,6 +67,8 @@ class TariffService : AccessibilityService() {
     private var lastDumpO = ""
 
     private var peeking = false
+    private var entryRect: Rect? = null
+    private var gestureTried = false
     private var returnPkg: String? = null
     private var lastUserActivityAt = 0L
     private var waitReason = ""
@@ -261,6 +263,17 @@ class TariffService : AccessibilityService() {
             }
 
             Step.WAIT_LOAD -> {
+                if (!gestureTried && now - stepAt >= 3000) {
+                    gestureTried = true
+                    val root = rootInActiveWindow
+                    val still = root != null && Parser.isMenuScreen(Parser.collect(root))
+                    val rect = entryRect
+                    if (still && rect != null) {
+                        tap(rect)
+                        stepAt = now - 1000 // дать ещё время на загрузку
+                        return
+                    }
+                }
                 if (now - stepAt > 15_000) {
                     fail(now, "Экран тарифов не открылся")
                 } else if (now - stepAt >= 1500 && now - lastAutoScanAt >= 1500) {
@@ -375,27 +388,32 @@ class TariffService : AccessibilityService() {
 
         val target = prefs.entryText.trim()
         if (target.isEmpty()) return Click.NOT_FOUND
-        val nodes = root.findAccessibilityNodeInfosByText(target)
-        val node = nodes.firstOrNull { nodeText(it).equals(target, ignoreCase = true) }
-            ?: nodes.firstOrNull { nodeText(it).startsWith(target, ignoreCase = true) }
-            ?: return Click.NOT_FOUND
+        val node = Parser.findByText(root, target) ?: return Click.NOT_FOUND
+        val r = Rect()
+        node.getBoundsInScreen(r)
+        entryRect = Rect(r)
+        gestureTried = false
 
         var n: AccessibilityNodeInfo? = node
         var depth = 0
-        while (n != null && depth < 6) {
+        while (n != null && depth < 8) {
             if (n.isClickable && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return Click.OK
             n = n.parent
             depth++
         }
-        // Запасной вариант — «тапнуть пальцем» по центру надписи.
-        val r = Rect()
-        node.getBoundsInScreen(r)
-        if (r.isEmpty) return Click.NOT_FOUND
+        // Кликабельного элемента нет — «тапаем пальцем».
+        gestureTried = true
+        return if (tap(r)) Click.OK else Click.NOT_FOUND
+    }
+
+    /** «Тапнуть пальцем» по центру прямоугольника. */
+    private fun tap(r: Rect): Boolean {
+        if (r.isEmpty) return false
         val path = Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()) }
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0, 80))
             .build()
-        return if (dispatchGesture(gesture, null, null)) Click.OK else Click.NOT_FOUND
+        return dispatchGesture(gesture, null, null)
     }
 
     private fun nodeText(n: AccessibilityNodeInfo): String =
